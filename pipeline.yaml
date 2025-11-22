@@ -1,0 +1,113 @@
+# Trigger pipeline only when code is pushed to main
+trigger:
+  - main
+
+# Self-hosted agent (Windows)
+pool:
+  name: 'default'
+  demands:
+    - agent.name -equals GAUTHAM
+
+# Variables
+variables:
+  pythonDir: 'C:\Users\gauth\AppData\Local\Programs\Python\Python311'
+  pythonExe: 'C:\Users\gauth\AppData\Local\Programs\Python\Python311\python.exe'
+  pythonScripts: 'C:\Users\gauth\AppData\Local\Programs\Python\Python311\Scripts'
+  resourceGroupName: 'smart_inventory'
+  functionAppName: 'orderprocess'
+  azureSubscription: 'smartconnection'
+  
+stages:
+
+# ==================== BUILD ====================
+- stage: Build
+  displayName: 'Build Project'
+  jobs:
+  - job: Build
+    steps:
+    - checkout: self
+
+    # 1️⃣ CHECK PYTHON
+    - script: |
+        echo ---- Checking Python ----
+        "%pythonExe%" --version
+        if %errorlevel% neq 0 exit /b 1
+      displayName: "Verify Python Installed in Agent"
+
+    # 2️⃣ INSTALL DEPENDENCIES (NO VENV)
+    - script: |
+        echo ---- Installing FUNCTION requirements ----
+        "%pythonExe%" -m pip install -r "$(Build.SourcesDirectory)\order_processing\requirements.txt"
+
+        echo ---- All dependencies installed successfully ----
+      displayName: "Install All Requirements"
+
+    # 3️⃣ ZIP the Azure Function App
+    - powershell: |
+        $source = "$(Build.SourcesDirectory)\order_processing"
+        $zip = "$(Build.ArtifactStagingDirectory)\order_processing.zip"
+
+        if (-not (Test-Path "$(Build.ArtifactStagingDirectory)")) {
+          New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)"
+        }
+
+        if (Test-Path $zip) { Remove-Item $zip -Force }
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($source, $zip)
+
+        Write-Host "Function App zipped at $zip"
+      displayName: "Zip Function App"
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathtoPublish: '$(Build.ArtifactStagingDirectory)\order_processing.zip'
+        artifactName: 'functionapp'
+      displayName: 'Publish ZIP Artifact'
+
+
+# ==================== DEPLOY ====================
+- stage: Deploy
+  displayName: "Deploy to Azure"
+  dependsOn: Build
+  condition: succeeded()
+
+  jobs:
+  - deployment: DeployJob
+    environment: "production"
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download Function App ZIP"
+            inputs:
+              buildType: 'current'
+              artifactName: 'functionapp'
+              targetPath: '$(Pipeline.Workspace)'
+
+          # 5️⃣ DEPLOY FUNCTION APP (ZIP)
+          - task: AzureCLI@2
+            displayName: "Deploy Python Function App"
+            inputs:
+              azureSubscription: '$(azureSubscription)'
+              scriptType: ps
+              scriptLocation: inlineScript
+              inlineScript: |
+                $functionAppName = "$(functionAppName)"
+                $resourceGroupName = "$(resourceGroupName)"
+                $zipPath = "$(Pipeline.Workspace)\functionapp\order_processing.zip"
+
+                if (-Not (Test-Path $zipPath)) {
+                    Write-Error "ZIP file not found at $zipPath"
+                    exit 1
+                }
+
+                Write-Host "Deploying Function App ZIP..."
+                az functionapp deployment source config-zip `
+                  --name $functionAppName `
+                  --resource-group $resourceGroupName `
+                  --src $zipPath
+
+                Write-Host "Function App Deployment Completed"
